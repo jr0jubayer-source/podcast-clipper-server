@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: podcast-clipper-server
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: MIN_SOURCE_SECONDS
+        value: "600"
+      - key: CLIP_MAX_SECONDS
+        value: "90"
+      - key: CLIP_MIN_SECONDS
+        value: "30"
+      - key: MIN_CLIPS
+        value: "4"
+      - key: MAX_CLIPS
+        value: "5"
+      - key: JOB_TTL_MS
+        value: "3600000"

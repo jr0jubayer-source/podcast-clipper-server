@@ -1,0 +1,16 @@
+{
+  "name": "podcast-clipper-server",
+  "version": "1.0.0",
+  "description": "yt-dlp + FFmpeg processing server for the podcast clipping pipeline.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
