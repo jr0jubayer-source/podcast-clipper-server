@@ -1,3 +1,17 @@
+/**
+ * Podcast Clipper Server
+ * ----------------------
+ * Runs on Render.com. Receives a video URL from the Cloudflare Worker,
+ * downloads it with yt-dlp, picks 4-5 high-energy "hook" windows using
+ * an audio-loudness heuristic, cuts them with ffmpeg, and exposes the
+ * resulting clips over HTTP so the Worker can hand them to Gemini and
+ * Telegram.
+ *
+ * This process does NOT do semantic "hook strength" analysis - that is
+ * intentionally left to the Gemini step in the pipeline. This server's
+ * job is fast, cheap, deterministic segment selection + cutting.
+ */
+
 const express = require("express");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -7,19 +21,28 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json());
 
+// ---------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || "";
+const API_KEY = process.env.API_KEY || ""; // shared secret with the Worker
 const TMP_ROOT = process.env.TMP_DIR || "/tmp/clipper-jobs";
-const MIN_SOURCE_SECONDS = Number(process.env.MIN_SOURCE_SECONDS || 600);
+const MIN_SOURCE_SECONDS = Number(process.env.MIN_SOURCE_SECONDS || 600); // 10 min
 const CLIP_MAX_SECONDS = Number(process.env.CLIP_MAX_SECONDS || 90);
 const CLIP_MIN_SECONDS = Number(process.env.CLIP_MIN_SECONDS || 30);
 const MIN_CLIPS = Number(process.env.MIN_CLIPS || 4);
 const MAX_CLIPS = Number(process.env.MAX_CLIPS || 5);
-const JOB_TTL_MS = Number(process.env.JOB_TTL_MS || 1000 * 60 * 60);
+const JOB_TTL_MS = Number(process.env.JOB_TTL_MS || 1000 * 60 * 60); // 1 hour
 
 fs.mkdirSync(TMP_ROOT, { recursive: true });
-const jobs = new Map();
 
+// In-memory job registry. Render's disk is ephemeral, so jobs are
+// meant to be consumed (downloaded by the Worker) quickly, then swept.
+const jobs = new Map(); // jobId -> { status, error, clips, createdAt, dir }
+
+// ---------------------------------------------------------------------
+// Small process helper
+// ---------------------------------------------------------------------
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { ...opts });
@@ -35,20 +58,31 @@ function run(cmd, args, opts = {}) {
   });
 }
 
+// ---------------------------------------------------------------------
+// Auth middleware - simple shared-secret header from the Worker
+// ---------------------------------------------------------------------
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
+  if (!API_KEY) return next(); // no key configured -> open (dev only)
   const provided = req.get("x-api-key");
-  if (provided !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+  if (provided !== API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
   next();
 }
 
+// ---------------------------------------------------------------------
+// Step 1: download source video with yt-dlp
+// ---------------------------------------------------------------------
 async function downloadVideo(url, destDir) {
   const outputTemplate = path.join(destDir, "source.%(ext)s");
   await run("yt-dlp", [
     "--no-playlist",
-    "-f", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
-    "--merge-output-format", "mp4",
-    "-o", outputTemplate,
+    "-f",
+    "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+    "--merge-output-format",
+    "mp4",
+    "-o",
+    outputTemplate,
     url,
   ]);
   const files = fs.readdirSync(destDir).filter((f) => f.startsWith("source."));
@@ -56,11 +90,17 @@ async function downloadVideo(url, destDir) {
   return path.join(destDir, files[0]);
 }
 
+// ---------------------------------------------------------------------
+// Step 2: probe duration
+// ---------------------------------------------------------------------
 async function getDurationSeconds(filePath) {
   const { stdout } = await run("ffprobe", [
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
     filePath,
   ]);
   const seconds = parseFloat(stdout.trim());
@@ -68,13 +108,29 @@ async function getDurationSeconds(filePath) {
   return seconds;
 }
 
+// ---------------------------------------------------------------------
+// Step 3: loudness-based hook window detection
+//
+// Heuristic: slide a window of CLIP_MAX_SECONDS across the source,
+// measure mean audio volume (dB) per window via ffmpeg's volumedetect,
+// then take the loudest non-overlapping windows as candidate "hooks".
+// Louder/denser audio energy tends to correlate with high-engagement
+// moments (reactions, punchlines, raised voices) in podcast content.
+// ---------------------------------------------------------------------
 async function measureMeanVolume(filePath, startSec, durationSec) {
   const { stderr } = await run("ffmpeg", [
-    "-ss", String(startSec),
-    "-t", String(durationSec),
-    "-i", filePath,
-    "-af", "volumedetect",
-    "-vn", "-f", "null", "-",
+    "-ss",
+    String(startSec),
+    "-t",
+    String(durationSec),
+    "-i",
+    filePath,
+    "-af",
+    "volumedetect",
+    "-vn",
+    "-f",
+    "null",
+    "-",
   ]);
   const match = stderr.match(/mean_volume:\s*(-?\d+(\.\d+)?)\s*dB/);
   return match ? parseFloat(match[1]) : -Infinity;
@@ -82,7 +138,7 @@ async function measureMeanVolume(filePath, startSec, durationSec) {
 
 async function findHookWindows(filePath, totalDuration) {
   const windowSize = CLIP_MAX_SECONDS;
-  const stride = Math.max(15, Math.floor(windowSize / 2));
+  const stride = Math.max(15, Math.floor(windowSize / 2)); // 50% overlap scan
   const candidates = [];
 
   for (let start = 0; start + CLIP_MIN_SECONDS <= totalDuration; start += stride) {
@@ -92,16 +148,21 @@ async function findHookWindows(filePath, totalDuration) {
     candidates.push({ start, duration, meanVolume });
   }
 
+  // Sort loudest first
   candidates.sort((a, b) => b.meanVolume - a.meanVolume);
 
+  // Greedily select non-overlapping windows, spaced out across the video
   const selected = [];
-  const minGap = Math.max(60, windowSize);
+  const minGap = Math.max(60, windowSize); // avoid picking near-duplicate moments
   for (const c of candidates) {
-    const overlaps = selected.some((s) => Math.abs(s.start - c.start) < minGap);
+    const overlaps = selected.some(
+      (s) => Math.abs(s.start - c.start) < minGap
+    );
     if (!overlaps) selected.push(c);
     if (selected.length >= MAX_CLIPS) break;
   }
 
+  // If we came up short (e.g. very short source), relax the gap constraint
   if (selected.length < MIN_CLIPS) {
     for (const c of candidates) {
       if (selected.length >= MIN_CLIPS) break;
@@ -113,20 +174,54 @@ async function findHookWindows(filePath, totalDuration) {
   return selected.slice(0, MAX_CLIPS);
 }
 
+// ---------------------------------------------------------------------
+// Step 4: cut clips with ffmpeg (re-encode for frame-accurate cuts)
+// ---------------------------------------------------------------------
 async function extractClip(filePath, start, duration, outPath) {
   await run("ffmpeg", [
-    "-ss", String(start),
-    "-i", filePath,
-    "-t", String(duration),
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
-    "-c:a", "aac",
-    "-movflags", "+faststart",
-    "-y", outPath,
+    "-ss",
+    String(start),
+    "-i",
+    filePath,
+    "-t",
+    String(duration),
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-c:a",
+    "aac",
+    "-movflags",
+    "+faststart",
+    "-y",
+    outPath,
   ]);
 }
 
+// A single mid-clip JPEG frame, used as a fallback input for image-only
+// AI analysis (e.g. a free OpenRouter vision model) when full video
+// analysis via Gemini is unavailable.
+async function extractThumbnail(clipPath, clipDuration, outPath) {
+  const midpoint = Math.max(0, clipDuration / 2);
+  await run("ffmpeg", [
+    "-ss",
+    String(midpoint),
+    "-i",
+    clipPath,
+    "-frames:v",
+    "1",
+    "-q:v",
+    "2",
+    "-y",
+    outPath,
+  ]);
+}
+
+// ---------------------------------------------------------------------
+// Cleanup old jobs periodically (Render disk is ephemeral but finite)
+// ---------------------------------------------------------------------
 setInterval(() => {
   const now = Date.now();
   for (const [jobId, job] of jobs.entries()) {
@@ -137,6 +232,9 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref();
 
+// ---------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/jobs/:jobId", requireApiKey, (req, res) => {
@@ -169,6 +267,7 @@ app.post("/process", requireApiKey, async (req, res) => {
   const job = { status: "processing", error: null, clips: [], createdAt: Date.now(), dir: jobDir };
   jobs.set(jobId, job);
 
+  // Respond immediately with the job id; processing continues async.
   res.status(202).json({ jobId, status: "processing" });
 
   try {
@@ -182,22 +281,31 @@ app.post("/process", requireApiKey, async (req, res) => {
     }
 
     const windows = await findHookWindows(sourcePath, totalDuration);
+
     const clips = [];
     for (let i = 0; i < windows.length; i++) {
       const { start, duration, meanVolume } = windows[i];
       const filename = `clip_${String(i + 1).padStart(2, "0")}.mp4`;
       const outPath = path.join(jobDir, filename);
       await extractClip(sourcePath, start, duration, outPath);
+
+      const thumbFilename = `clip_${String(i + 1).padStart(2, "0")}_thumb.jpg`;
+      const thumbPath = path.join(jobDir, thumbFilename);
+      await extractThumbnail(outPath, duration, thumbPath);
+
       clips.push({
         index: i + 1,
         filename,
+        thumbnailFilename: thumbFilename,
         startSeconds: Math.round(start),
         durationSeconds: Math.round(duration),
         loudnessScoreDb: Number.isFinite(meanVolume) ? Number(meanVolume.toFixed(1)) : null,
         url: `/clips/${jobId}/${filename}`,
+        thumbnailUrl: `/clips/${jobId}/${thumbFilename}`,
       });
     }
 
+    // Free up space: the full source is no longer needed once cut
     fs.rm(sourcePath, { force: true }, () => {});
 
     job.status = "done";
