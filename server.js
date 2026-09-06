@@ -27,7 +27,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || ""; // shared secret with the Worker
 const TMP_ROOT = process.env.TMP_DIR || "/tmp/clipper-jobs";
-const MIN_SOURCE_SECONDS = Number(process.env.MIN_SOURCE_SECONDS || 600); // 10 min
+const MIN_SOURCE_SECONDS = Number(process.env.MIN_SOURCE_SECONDS || 15); // 15 sec floor - filters out near-nothing clips, allows normal Reels through
 const CLIP_MAX_SECONDS = Number(process.env.CLIP_MAX_SECONDS || 90);
 const CLIP_MIN_SECONDS = Number(process.env.CLIP_MIN_SECONDS || 30);
 const MIN_CLIPS = Number(process.env.MIN_CLIPS || 4);
@@ -137,6 +137,12 @@ async function measureMeanVolume(filePath, startSec, durationSec) {
 }
 
 async function findHookWindows(filePath, totalDuration) {
+  // Short source (typical for Reels/short clips): just use the whole
+  // thing as one clip instead of skipping it or hunting for sub-windows.
+  if (totalDuration <= CLIP_MAX_SECONDS) {
+    return [{ start: 0, duration: totalDuration, meanVolume: null }];
+  }
+
   const windowSize = CLIP_MAX_SECONDS;
   const stride = Math.max(15, Math.floor(windowSize / 2)); // 50% overlap scan
   const candidates = [];
