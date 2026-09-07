@@ -32,6 +32,8 @@ const CLIP_MAX_SECONDS = Number(process.env.CLIP_MAX_SECONDS || 90);
 const CLIP_MIN_SECONDS = Number(process.env.CLIP_MIN_SECONDS || 30);
 const MIN_CLIPS = Number(process.env.MIN_CLIPS || 4);
 const MAX_CLIPS = Number(process.env.MAX_CLIPS || 5);
+const LONG_FORM_SECONDS = Number(process.env.LONG_FORM_SECONDS || 600); // MIN_CLIPS is only enforced at/above this duration
+const POSTER_THUMBNAIL_COUNT = 5; // always generated, spread across the full source, independent of clip count
 const JOB_TTL_MS = Number(process.env.JOB_TTL_MS || 1000 * 60 * 60); // 1 hour
 
 fs.mkdirSync(TMP_ROOT, { recursive: true });
@@ -167,11 +169,16 @@ function mergeWindows(windows, gapThresholdSec = 5) {
     const curr = sorted[i];
     const prevEnd = prev.start + prev.duration;
     const gap = curr.start - prevEnd;
-    const mergedEnd = Math.max(prevEnd, curr.start + curr.duration);
-    const mergedDuration = mergedEnd - prev.start;
 
-    if (gap < gapThresholdSec && mergedDuration <= CLIP_MAX_SECONDS) {
-      prev.duration = mergedDuration;
+    if (gap < gapThresholdSec) {
+      // Overlapping or adjacent - always merge, then cap the result to
+      // CLIP_MAX_SECONDS (trimming the tail) rather than skipping the
+      // merge entirely. Since raw scan windows are already
+      // CLIP_MAX_SECONDS wide, refusing to merge anything over that
+      // length would make merging a no-op for the exact case it exists
+      // to handle.
+      const mergedEnd = Math.max(prevEnd, curr.start + curr.duration);
+      prev.duration = Math.min(mergedEnd - prev.start, CLIP_MAX_SECONDS);
       prev.meanVolume = Math.max(
         prev.meanVolume ?? -Infinity,
         curr.meanVolume ?? -Infinity
@@ -219,8 +226,11 @@ async function findHookWindows(filePath, totalDuration) {
     if (selected.length >= MAX_CLIPS) break;
   }
 
-  // If we came up short (e.g. very short source), relax the gap constraint
-  if (selected.length < MIN_CLIPS) {
+  // If we came up short, only force extra (possibly overlapping) clips
+  // for genuinely long-form content. For shorter videos, honest natural
+  // clip count (even just 1-3) is correct - forcing 4 clips out of a
+  // ~3-minute video just produces near-duplicate overlapping content.
+  if (totalDuration >= LONG_FORM_SECONDS && selected.length < MIN_CLIPS) {
     for (const c of candidates) {
       if (selected.length >= MIN_CLIPS) break;
       if (!selected.includes(c)) selected.push(c);
@@ -303,6 +313,47 @@ async function extractThumbnail(clipPath, clipDuration, outPath) {
     "-y",
     outPath,
   ]);
+}
+
+// Grabs a single frame from the ORIGINAL source at an absolute timestamp.
+async function extractFrameAt(sourcePath, atSeconds, outPath) {
+  await run("ffmpeg", [
+    "-ss",
+    String(atSeconds),
+    "-i",
+    sourcePath,
+    "-frames:v",
+    "1",
+    "-q:v",
+    "2",
+    "-y",
+    outPath,
+  ]);
+}
+
+// Always produces POSTER_THUMBNAIL_COUNT (5) thumbnail options spread
+// evenly across the full source video, independent of how many actual
+// video clips were extracted. This gives a real choice of thumbnail
+// images for posting even when a short video only yields 1-2 clips.
+async function generatePosterThumbnails(sourcePath, totalDuration, jobDir, jobId) {
+  const fractions = [0.1, 0.3, 0.5, 0.7, 0.9].slice(0, POSTER_THUMBNAIL_COUNT);
+  const thumbnails = [];
+  for (let i = 0; i < fractions.length; i++) {
+    const atSeconds = Math.min(
+      Math.max(0, totalDuration - 0.5),
+      totalDuration * fractions[i]
+    );
+    const filename = `poster_${i + 1}.jpg`;
+    const outPath = path.join(jobDir, filename);
+    await extractFrameAt(sourcePath, atSeconds, outPath);
+    thumbnails.push({
+      index: i + 1,
+      timestampSeconds: Math.round(atSeconds),
+      filename,
+      url: `/clips/${jobId}/${filename}`,
+    });
+  }
+  return thumbnails;
 }
 
 // ---------------------------------------------------------------------
@@ -391,11 +442,22 @@ app.post("/process", requireApiKey, async (req, res) => {
       });
     }
 
+    // Always generate 5 poster thumbnail options from the full source,
+    // independent of clip count - even a 2-clip short video gets a real
+    // choice of thumbnail images for posting.
+    const posterThumbnails = await generatePosterThumbnails(
+      sourcePath,
+      totalDuration,
+      jobDir,
+      jobId
+    );
+
     // Free up space: the full source is no longer needed once cut
     fs.rm(sourcePath, { force: true }, () => {});
 
     job.status = "done";
     job.clips = clips;
+    job.posterThumbnails = posterThumbnails;
     job.sourceDurationSeconds = Math.round(totalDuration);
   } catch (err) {
     job.status = "error";
