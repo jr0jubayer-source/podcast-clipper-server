@@ -48,10 +48,23 @@ function run(cmd, args, opts = {}) {
     const child = spawn(cmd, args, { ...opts });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    let timer = null;
+    if (opts.timeoutMs) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, opts.timeoutMs);
+    }
     child.stdout?.on("data", (d) => (stdout += d.toString()));
     child.stderr?.on("data", (d) => (stderr += d.toString()));
-    child.on("error", reject);
+    child.on("error", (err) => {
+      if (timer) clearTimeout(timer);
+      reject(err);
+    });
     child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      if (timedOut) return reject(new Error(`${cmd} timed out after ${opts.timeoutMs}ms`));
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`${cmd} exited ${code}: ${stderr.slice(-2000)}`));
     });
@@ -136,6 +149,40 @@ async function measureMeanVolume(filePath, startSec, durationSec) {
   return match ? parseFloat(match[1]) : -Infinity;
 }
 
+// Merges overlapping or near-adjacent windows into single windows before
+// selection, so we don't waste extraction work on near-duplicate clips
+// that share most of their content. Capped at CLIP_MAX_SECONDS so merges
+// can't produce an oversized clip.
+function mergeWindows(windows, gapThresholdSec = 5) {
+  if (windows.length === 0) return [];
+  const sorted = [...windows]
+    .filter((w) => w.duration > 0)
+    .sort((a, b) => a.start - b.start);
+  if (sorted.length === 0) return [];
+
+  const merged = [{ ...sorted[0] }];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = merged[merged.length - 1];
+    const curr = sorted[i];
+    const prevEnd = prev.start + prev.duration;
+    const gap = curr.start - prevEnd;
+    const mergedEnd = Math.max(prevEnd, curr.start + curr.duration);
+    const mergedDuration = mergedEnd - prev.start;
+
+    if (gap < gapThresholdSec && mergedDuration <= CLIP_MAX_SECONDS) {
+      prev.duration = mergedDuration;
+      prev.meanVolume = Math.max(
+        prev.meanVolume ?? -Infinity,
+        curr.meanVolume ?? -Infinity
+      );
+    } else {
+      merged.push({ ...curr });
+    }
+  }
+  return merged;
+}
+
 async function findHookWindows(filePath, totalDuration) {
   // Short source (typical for Reels/short clips): just use the whole
   // thing as one clip instead of skipping it or hunting for sub-windows.
@@ -145,14 +192,18 @@ async function findHookWindows(filePath, totalDuration) {
 
   const windowSize = CLIP_MAX_SECONDS;
   const stride = Math.max(15, Math.floor(windowSize / 2)); // 50% overlap scan
-  const candidates = [];
+  const rawCandidates = [];
 
   for (let start = 0; start + CLIP_MIN_SECONDS <= totalDuration; start += stride) {
     const duration = Math.min(windowSize, totalDuration - start);
     if (duration < CLIP_MIN_SECONDS) continue;
     const meanVolume = await measureMeanVolume(filePath, start, duration);
-    candidates.push({ start, duration, meanVolume });
+    rawCandidates.push({ start, duration, meanVolume });
   }
+
+  // Merge overlapping/adjacent windows first so selection works on
+  // distinct, non-redundant candidates instead of near-duplicates.
+  const candidates = mergeWindows(rawCandidates);
 
   // Sort loudest first
   candidates.sort((a, b) => b.meanVolume - a.meanVolume);
@@ -183,7 +234,36 @@ async function findHookWindows(filePath, totalDuration) {
 // ---------------------------------------------------------------------
 // Step 4: cut clips with ffmpeg (re-encode for frame-accurate cuts)
 // ---------------------------------------------------------------------
+// Tries a fast, lossless stream copy first (works when the seek point
+// lands cleanly on a keyframe - near-instant, no re-encode). Falls back
+// to a full re-encode with the fastest usable preset if that fails or
+// produces a suspiciously small/invalid file.
 async function extractClip(filePath, start, duration, outPath) {
+  try {
+    await run(
+      "ffmpeg",
+      [
+        "-ss",
+        String(start),
+        "-i",
+        filePath,
+        "-t",
+        String(duration),
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-y",
+        outPath,
+      ],
+      { timeoutMs: 15000 }
+    );
+    const stat = fs.existsSync(outPath) ? fs.statSync(outPath) : null;
+    if (stat && stat.size > 1024) return; // copy succeeded, done
+  } catch (_) {
+    // keyframe misalignment or other failure - fall through to re-encode
+  }
+
   await run("ffmpeg", [
     "-ss",
     String(start),
@@ -194,7 +274,7 @@ async function extractClip(filePath, start, duration, outPath) {
     "-c:v",
     "libx264",
     "-preset",
-    "veryfast",
+    "ultrafast",
     "-crf",
     "23",
     "-c:a",
