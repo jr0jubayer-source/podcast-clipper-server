@@ -465,6 +465,81 @@ app.post("/process", requireApiKey, async (req, res) => {
   }
 });
 
+// =====================================================================
+// FILE MODE: process a raw video upload with NO yt-dlp and NO Facebook
+// contact. The phone (residential IP) downloads the reel, then the
+// Worker streams the bytes here. Everything downstream is identical.
+// =====================================================================
+app.post("/process-file", requireApiKey, express.raw({ type: "*/*", limit: "300mb" }), async (req, res) => {
+  if (!Buffer.isBuffer(req.body) || req.body.length < 1024) {
+    return res.status(400).json({ error: "body must be the raw video bytes" });
+  }
+
+  const jobId = crypto.randomBytes(8).toString("hex");
+  const jobDir = path.join(TMP_ROOT, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+
+  const sourcePath = path.join(jobDir, "source.mp4");
+  fs.writeFileSync(sourcePath, req.body);
+
+  const job = { status: "processing", error: null, clips: [], createdAt: Date.now(), dir: jobDir };
+  jobs.set(jobId, job);
+
+  res.status(202).json({ jobId, status: "processing" });
+
+  try {
+    const totalDuration = await getDurationSeconds(sourcePath);
+
+    if (totalDuration < MIN_SOURCE_SECONDS) {
+      job.status = "skipped";
+      job.error = "Source is " + Math.round(totalDuration) + "s, below the " + MIN_SOURCE_SECONDS + "s minimum";
+      return;
+    }
+
+    const windows = await findHookWindows(sourcePath, totalDuration);
+
+    const clips = [];
+    for (let i = 0; i < windows.length; i++) {
+      const w = windows[i];
+      const filename = "clip_" + String(i + 1).padStart(2, "0") + ".mp4";
+      const outPath = path.join(jobDir, filename);
+      await extractClip(sourcePath, w.start, w.duration, outPath);
+
+      const thumbFilename = "clip_" + String(i + 1).padStart(2, "0") + "_thumb.jpg";
+      const thumbPath = path.join(jobDir, thumbFilename);
+      await extractThumbnail(outPath, w.duration, thumbPath);
+
+      clips.push({
+        index: i + 1,
+        filename: filename,
+        thumbnailFilename: thumbFilename,
+        startSeconds: Math.round(w.start),
+        durationSeconds: Math.round(w.duration),
+        loudnessScoreDb: Number.isFinite(w.meanVolume) ? Number(w.meanVolume.toFixed(1)) : null,
+        url: "/clips/" + jobId + "/" + filename,
+        thumbnailUrl: "/clips/" + jobId + "/" + thumbFilename,
+      });
+    }
+
+    const posterThumbnails = await generatePosterThumbnails(
+      sourcePath,
+      totalDuration,
+      jobDir,
+      jobId
+    );
+
+    fs.rm(sourcePath, { force: true }, () => {});
+
+    job.status = "done";
+    job.clips = clips;
+    job.posterThumbnails = posterThumbnails;
+    job.sourceDurationSeconds = Math.round(totalDuration);
+  } catch (err) {
+    job.status = "error";
+    job.error = String(err.message || err);
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Podcast clipper server listening on :${PORT}`);
 });
